@@ -117,28 +117,82 @@ class PlaylistScraper {
   async scrapeSpotifyPlaylist(playlistId) {
     try {
       const embedUrl = `https://open.spotify.com/embed/playlist/${playlistId}`;
-      await this.page.goto(embedUrl, { waitUntil: "networkidle0" });
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+
+      // Wait for page load with timeout
+      await this.page.goto(embedUrl, {
+        waitUntil: "networkidle0",
+        timeout: 30000,
+      });
+
+      // Wait for the actual content to be visible
+      await this.page.waitForSelector('[data-testid="track-list"]', {
+        timeout: 10000,
+      });
+
+      // Scroll to load all content
+      await this.page.evaluate(async () => {
+        const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const container = document.querySelector('[data-testid="track-list"]');
+
+        let previousHeight = 0;
+        let currentHeight = container.scrollHeight;
+
+        while (previousHeight !== currentHeight) {
+          previousHeight = currentHeight;
+          container.scrollTo(0, currentHeight);
+          await delay(500);
+          currentHeight = container.scrollHeight;
+        }
+      });
+
+      // Get the content after all is loaded
       const textContent = await this.page.evaluate(
         () => document.body.innerText
       );
+
       return this.parsePlaylistContent(textContent);
     } catch (error) {
       console.error("Error scraping Spotify playlist:", error);
       return [];
     }
   }
-
+  
   async createYouTubePlaylist(songs) {
+    // Create chunks of songs for batch processing
+    const chunkSize = 5; // Process 5 songs at a time
+    const chunks = [];
+
+    for (let i = 0; i < songs.length; i += chunkSize) {
+      chunks.push(songs.slice(i, i + chunkSize));
+    }
+
     const playlist = [];
 
-    for (const song of songs) {
-      console.log(`Searching for: ${song}`);
-      const video = await this.searchYouTube(song);
-      if (video) {
-        playlist.push(video);
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
+    // Process each chunk in parallel while maintaining order
+    for (const chunk of chunks) {
+      const chunkPromises = chunk.map(async (song, index) => {
+        console.log(`Searching for: ${song}`);
+        const video = await this.searchYouTube(song);
+        return {
+          index,
+          video,
+        };
+      });
+
+      // Wait for all songs in the chunk to complete
+      const chunkResults = await Promise.all(chunkPromises);
+
+      // Sort by original index and add to playlist
+      chunkResults
+        .sort((a, b) => a.index - b.index)
+        .forEach((result) => {
+          if (result.video) {
+            playlist.push(result.video);
+          }
+        });
+
+      // Small delay between chunks to avoid rate limiting
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
     return playlist;
@@ -175,7 +229,7 @@ app.post("/api/convert", async (req, res) => {
 
     const songs = await scraper.scrapeSpotifyPlaylist(playlistId);
     const youtubePlaylist = await scraper.createYouTubePlaylist(songs);
-    console.log(totalSongs)
+    console.log(totalSongs);
 
     res.json({
       success: true,
