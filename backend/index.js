@@ -42,35 +42,56 @@ class PlaylistScraper {
   }
 
   async searchYouTube(query) {
-    try {
-      await this.page.goto(
-        `https://www.youtube.com/results?search_query=${encodeURIComponent(
-          query
-        )}`
-      );
-      await this.page.waitForSelector("#contents");
+    const maxRetries = 3;
+    let retryCount = 0;
 
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+    while (retryCount < maxRetries) {
+      try {
+        // Create a new page for each search to avoid navigation conflicts
+        const searchPage = await this.browser.newPage();
 
-      const content = await this.page.content();
-      const $ = cheerio.load(content);
+        await searchPage.setDefaultNavigationTimeout(30000);
+        await searchPage.goto(
+          `https://www.youtube.com/results?search_query=${encodeURIComponent(
+            query
+          )}`,
+          { waitUntil: "networkidle0" }
+        );
 
-      const firstVideo = $("#contents ytd-video-renderer").first();
-      const videoId = firstVideo.find("#thumbnail").attr("href");
-      const title = firstVideo.find("#video-title").text().trim();
+        await searchPage.waitForSelector("#contents");
+        await new Promise((resolve) => setTimeout(resolve, 2000));
 
-      if (videoId) {
-        const videoIdMatch = videoId.match(/[?&]v=([^&]+)/);
-        return {
-          videoId: videoIdMatch ? videoIdMatch[1] : videoId.split("/").pop(),
-          title,
-          url: `https://youtube.com${videoId}`,
-        };
+        const content = await searchPage.content();
+        const $ = cheerio.load(content);
+
+        const firstVideo = $("#contents ytd-video-renderer").first();
+        const videoId = firstVideo.find("#thumbnail").attr("href");
+        const title = firstVideo.find("#video-title").text().trim();
+
+        // Close the search page
+        await searchPage.close();
+
+        if (videoId) {
+          const videoIdMatch = videoId.match(/[?&]v=([^&]+)/);
+          return {
+            videoId: videoIdMatch ? videoIdMatch[1] : videoId.split("/").pop(),
+            title,
+            url: `https://youtube.com${videoId}`,
+          };
+        }
+        return null;
+      } catch (error) {
+        retryCount++;
+        console.error(`Attempt ${retryCount} failed for "${query}":`, error);
+
+        // Wait longer between retries
+        await new Promise((resolve) => setTimeout(resolve, 2000 * retryCount));
+
+        if (retryCount === maxRetries) {
+          console.error(`All attempts failed for "${query}"`);
+          return null;
+        }
       }
-      return null;
-    } catch (error) {
-      console.error(`Error searching YouTube for ${query}:`, error);
-      return null;
     }
   }
 
@@ -118,48 +139,49 @@ class PlaylistScraper {
     try {
       const embedUrl = `https://open.spotify.com/embed/playlist/${playlistId}`;
 
-      // Wait for page load with timeout
+      // Navigate with basic networkidle0 wait
       await this.page.goto(embedUrl, {
         waitUntil: "networkidle0",
         timeout: 30000,
       });
 
-      // Wait for the actual content to be visible
-      await this.page.waitForSelector('[data-testid="track-list"]', {
-        timeout: 10000,
-      });
+      // Initial pause to let dynamic content load
+      await new Promise((resolve) => setTimeout(resolve, 2000));
 
-      // Scroll to load all content
-      await this.page.evaluate(async () => {
-        const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-        const container = document.querySelector('[data-testid="track-list"]');
+      // Check if any content has loaded
+      const initialContent = await this.page.evaluate(
+        () => document.body.innerText
+      );
+      if (!initialContent) {
+        throw new Error("No content loaded");
+      }
 
-        let previousHeight = 0;
-        let currentHeight = container.scrollHeight;
+      // Additional wait if content is too short (might still be loading)
+      if (initialContent.split("\n").length < 5) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
 
-        while (previousHeight !== currentHeight) {
-          previousHeight = currentHeight;
-          container.scrollTo(0, currentHeight);
-          await delay(500);
-          currentHeight = container.scrollHeight;
-        }
-      });
-
-      // Get the content after all is loaded
+      // Get final content
       const textContent = await this.page.evaluate(
         () => document.body.innerText
       );
+      const songs = this.parsePlaylistContent(textContent);
 
-      return this.parsePlaylistContent(textContent);
+      // Validate we got some songs
+      if (!songs || songs.length === 0) {
+        throw new Error("No songs found in playlist");
+      }
+
+      return songs;
     } catch (error) {
       console.error("Error scraping Spotify playlist:", error);
       return [];
     }
   }
-  
+
   async createYouTubePlaylist(songs) {
-    // Create chunks of songs for batch processing
-    const chunkSize = 5; // Process 5 songs at a time
+    // Process in smaller chunks
+    const chunkSize = 3; // Reduced from 5 to 3
     const chunks = [];
 
     for (let i = 0; i < songs.length; i += chunkSize) {
@@ -168,7 +190,6 @@ class PlaylistScraper {
 
     const playlist = [];
 
-    // Process each chunk in parallel while maintaining order
     for (const chunk of chunks) {
       const chunkPromises = chunk.map(async (song, index) => {
         console.log(`Searching for: ${song}`);
@@ -179,10 +200,9 @@ class PlaylistScraper {
         };
       });
 
-      // Wait for all songs in the chunk to complete
+      // Process chunk and wait longer between chunks
       const chunkResults = await Promise.all(chunkPromises);
 
-      // Sort by original index and add to playlist
       chunkResults
         .sort((a, b) => a.index - b.index)
         .forEach((result) => {
@@ -191,8 +211,8 @@ class PlaylistScraper {
           }
         });
 
-      // Small delay between chunks to avoid rate limiting
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Increased delay between chunks
+      await new Promise((resolve) => setTimeout(resolve, 3000));
     }
 
     return playlist;
@@ -210,7 +230,6 @@ async function initializeScraper() {
   }
 }
 
-// API endpoint
 app.post("/api/convert", async (req, res) => {
   try {
     const { playlistUrl } = req.body;
@@ -229,7 +248,6 @@ app.post("/api/convert", async (req, res) => {
 
     const songs = await scraper.scrapeSpotifyPlaylist(playlistId);
     const youtubePlaylist = await scraper.createYouTubePlaylist(songs);
-    console.log(totalSongs);
 
     res.json({
       success: true,
