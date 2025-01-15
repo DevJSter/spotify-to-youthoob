@@ -5,15 +5,12 @@ const cheerio = require("cheerio");
 
 const app = express();
 
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: "*" }));
 
-
 // Additional CORS headers for extra compatibility
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header(
     "Access-Control-Allow-Headers",
@@ -22,8 +19,6 @@ app.use((req, res, next) => {
   res.header("Access-Control-Allow-Credentials", true);
   next();
 });
-
-app.use(express.json());
 
 class PlaylistScraper {
   constructor() {
@@ -135,6 +130,56 @@ class PlaylistScraper {
     return songs;
   }
 
+  parseAlbumContent(content) {
+    const songs = [];
+    const lines = content.split("\n");
+
+    let currentSong = null;
+    let currentArtists = null;
+    let skipNext = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+
+      // Skip empty lines and common non-song text
+      if (
+        !line ||
+        line === "Preview" ||
+        line === "E" ||
+        line === "Save on Spotify" ||
+        line.match(/^\d+$/) ||
+        line.match(/^\d{2}:\d{2}$/) ||
+        line.includes("more") ||
+        skipNext
+      ) {
+        skipNext = false;
+        continue;
+      }
+
+      // Skip lines that are likely track numbers
+      if (line.match(/^\d+$/)) {
+        continue;
+      }
+
+      if (!currentSong) {
+        currentSong = line;
+      } else if (!currentArtists) {
+        currentArtists = line;
+
+        if (currentSong && currentArtists) {
+          const uniqueArtists = [...new Set(currentArtists.split(", "))].join(
+            ", "
+          );
+          songs.push(`${currentSong} - ${uniqueArtists}`);
+          currentSong = null;
+          currentArtists = null;
+        }
+      }
+    }
+
+    return songs;
+  }
+
   async scrapeSpotifyPlaylist(playlistId) {
     try {
       const embedUrl = `https://open.spotify.com/embed/playlist/${playlistId}`;
@@ -179,9 +224,55 @@ class PlaylistScraper {
     }
   }
 
+  async scrapeSpotifyAlbum(albumId) {
+    try {
+      const embedUrl = `https://open.spotify.com/embed/album/${albumId}`;
+
+      // Navigate with basic networkidle0 wait
+      await this.page.goto(embedUrl, {
+        waitUntil: "networkidle0",
+        timeout: 30000,
+      });
+
+      // Initial pause to let dynamic content load
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+
+      // Check if any content has loaded
+      const initialContent = await this.page.evaluate(
+        () => document.body.innerText
+      );
+      if (!initialContent) {
+        throw new Error("No content loaded");
+      }
+
+      // Additional wait if content is too short (might still be loading)
+      if (initialContent.split("\n").length < 5) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+
+      // Get final content
+      const textContent = await this.page.evaluate(
+        () => document.body.innerText
+      );
+
+      // Parse album content
+      const songs = this.parseAlbumContent(textContent);
+
+      // Validate we got some songs
+      if (!songs || songs.length === 0) {
+        throw new Error("No songs found in album");
+      }
+
+      return songs;
+    } catch (error) {
+      console.error("Error scraping Spotify album:", error);
+      return [];
+    }
+  }
+
   async createYouTubePlaylist(songs) {
     // Process in smaller chunks
-    const chunkSize = 3; // Reduced from 5 to 3
+    const chunkSize = 3;
     const chunks = [];
 
     for (let i = 0; i < songs.length; i += chunkSize) {
@@ -235,18 +326,27 @@ app.post("/api/convert", async (req, res) => {
     const { playlistUrl } = req.body;
 
     if (!playlistUrl) {
-      return res.status(400).json({ error: "Playlist URL is required" });
+      return res.status(400).json({ error: "URL is required" });
     }
 
     await initializeScraper();
 
+    let songs = [];
+    const albumId = playlistUrl.split("/album/")[1]?.split("?")[0];
     const playlistId = playlistUrl.split("/playlist/")[1]?.split("?")[0];
 
-    if (!playlistId) {
-      return res.status(400).json({ error: "Invalid playlist URL" });
+    if (albumId) {
+      songs = await scraper.scrapeSpotifyAlbum(albumId);
+    } else if (playlistId) {
+      songs = await scraper.scrapeSpotifyPlaylist(playlistId);
+    } else {
+      return res.status(400).json({ error: "Invalid Spotify URL" });
     }
 
-    const songs = await scraper.scrapeSpotifyPlaylist(playlistId);
+    if (!songs || songs.length === 0) {
+      return res.status(404).json({ error: "No songs found" });
+    }
+
     const youtubePlaylist = await scraper.createYouTubePlaylist(songs);
 
     res.json({
@@ -256,7 +356,10 @@ app.post("/api/convert", async (req, res) => {
     });
   } catch (error) {
     console.error("Conversion error:", error);
-    res.status(500).json({ error: "Failed to convert playlist" });
+    res.status(500).json({
+      error: "Failed to convert playlist/album",
+      details: error.message,
+    });
   }
 });
 

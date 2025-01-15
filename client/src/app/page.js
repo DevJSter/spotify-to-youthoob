@@ -7,7 +7,8 @@ export default function SpotifyYouTubeConverter() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+  const API_URL =
+    "http://localhost:3001";
 
   const handleConvert = async () => {
     try {
@@ -55,10 +56,10 @@ export default function SpotifyYouTubeConverter() {
           <div className="space-y-4">
             <div>
               <h2 className="text-2xl font-bold text-gray-900">
-                Spotify to YouTube Converter
+                Spotify Playlist/Album to YouTube Converter
               </h2>
               <p className="mt-1 text-sm text-gray-500">
-                Enter a Spotify playlist URL to get YouTube equivalents
+                Enter a Spotify playlist or Album URL to start
               </p>
             </div>
 
